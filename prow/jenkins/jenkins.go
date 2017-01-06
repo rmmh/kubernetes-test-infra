@@ -63,6 +63,7 @@ type Build struct {
 	refs     string
 	id       string
 	queueURL *url.URL
+	buildURL string
 }
 
 func NewClient(url, user, token string) *Client {
@@ -163,14 +164,14 @@ func (c *Client) Enqueued(b *Build) (bool, error) {
 	if c.dry {
 		return false, nil
 	}
-	u := fmt.Sprintf("%s/%sapi/json", c.baseURL, b.queueURL)
+	u := fmt.Sprintf("%sapi/json", b.queueURL)
 	resp, err := c.request(http.MethodGet, u)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, fmt.Errorf("response not 2XX: %s", resp.Status)
+		return false, fmt.Errorf("response not 2XX: %s, url: %s", resp.Status, u)
 	}
 	buf, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -180,7 +181,8 @@ func (c *Client) Enqueued(b *Build) (bool, error) {
 		Cancelled  bool   `json:"cancelled"`
 		Why        string `json:"why"`
 		Executable struct {
-			Number int `json:"number"`
+			Number int    `json:"number"`
+			Url    string `json:"url"`
 		} `json:"executable"`
 	}{}
 	err = json.Unmarshal(buf, &item)
@@ -191,6 +193,7 @@ func (c *Client) Enqueued(b *Build) (bool, error) {
 		return false, fmt.Errorf("job was cancelled: %s", item.Why)
 	}
 	if item.Executable.Number != 0 {
+		b.buildURL = item.Executable.Url
 		return true, nil
 	}
 	return false, nil
@@ -232,7 +235,10 @@ func (c *Client) Status(b *Build) (*Status, error) {
 			Success:  true,
 		}, nil
 	}
-	u := fmt.Sprintf("%s/job/%s/api/json?tree=builds[number,result,actions[parameters[name,value]]]", c.baseURL, b.jobName)
+	if b.buildURL == "" {
+		return nil, fmt.Errorf("build has not had a queue check?")
+	}
+	u := fmt.Sprintf("%sapi/json?tree=number,result,actions[parameters[name,value]]", b.buildURL)
 	resp, err := c.request(http.MethodGet, u)
 	if err != nil {
 		return nil, err
@@ -245,35 +251,31 @@ func (c *Client) Status(b *Build) (*Status, error) {
 	if err != nil {
 		return nil, err
 	}
-	builds := struct {
-		Builds []struct {
-			Actions []struct {
-				Parameters []struct {
-					Name  string `json:"name"`
-					Value string `json:"value"`
-				} `json:"parameters"`
-			} `json:"actions"`
-			Number int     `json:"number"`
-			Result *string `json:"result"`
-		} `json:"builds"`
+	build := struct {
+		Actions []struct {
+			Parameters []struct {
+				Name  string `json:"name"`
+				Value string `json:"value"`
+			} `json:"parameters"`
+		} `json:"actions"`
+		Number int     `json:"number"`
+		Result *string `json:"result"`
 	}{}
-	err = json.Unmarshal(buf, &builds)
+	err = json.Unmarshal(buf, &build)
 	if err != nil {
 		return nil, err
 	}
-	for _, build := range builds.Builds {
-		for _, action := range build.Actions {
-			for _, p := range action.Parameters {
-				if p.Name == "buildId" && p.Value == b.id {
-					if build.Result == nil {
-						return &Status{Building: true, Number: build.Number}, nil
-					} else {
-						return &Status{
-							Building: false,
-							Success:  *build.Result == "SUCCESS",
-							Number:   build.Number,
-						}, nil
-					}
+	for _, action := range build.Actions {
+		for _, p := range action.Parameters {
+			if p.Name == "buildId" && p.Value == b.id {
+				if build.Result == nil {
+					return &Status{Building: true, Number: build.Number}, nil
+				} else {
+					return &Status{
+						Building: false,
+						Success:  *build.Result == "SUCCESS",
+						Number:   build.Number,
+					}, nil
 				}
 			}
 		}
